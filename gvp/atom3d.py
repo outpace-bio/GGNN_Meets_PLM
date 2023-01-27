@@ -40,8 +40,9 @@ def _edge_features(coords, edge_index, D_max=4.5, num_rbf=16, device='cpu'):
 def get_plm_reps(df, model, converter):
     seq = ''.join([RESTYPE_3to1(i) for i in list(df['resname'])])
     batch_tokens = converter([("_", seq)])[2]  # [label, sequence]
+    batch_tokens = batch_tokens.to(model.device)
     with torch.no_grad():
-        results = model(batch_tokens.cuda(), repr_layers=[33], return_contacts=True)  # Extract per-residue representations
+        results = model(batch_tokens, repr_layers=[33], return_contacts=True)  # Extract per-residue representations
     token_reps = results["representations"][33][:, 1:-1][0].detach()                  # the head and tail tokens are placeholder
     return token_reps
 
@@ -154,7 +155,8 @@ class PSRTransform(BaseTransform):
         if self.plm:
             self.model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()  # load the latest ESM-2
             self.batch_converter = alphabet.get_batch_converter()
-            self.model.eval().cuda()
+            self.model.eval()
+            self.model = self.model.to(self.device)
 
     def __call__(self, elem, index_filter=False):
         df = elem['atoms']
