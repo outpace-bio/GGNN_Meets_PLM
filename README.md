@@ -27,6 +27,7 @@ pip install pandas openpyxl
 When you pip install torch, it now installs version 1.13 + cuda 117, so we have to update the versions of cluster, scatter, and sparse.
 Everything else is the same.
 ```
+IF RUNNING ON AWS GPU INSTANCE
 pip install torch
 pip install atom3d
 pip install -U scikit-learn
@@ -37,6 +38,20 @@ pip install torch-geometric
 pip install fair-esm  
 pip install pandas openpyxl
 ```
+```
+IF RUNNING ON LAMBDA LABS -- their instances use an earlier version of torch/CUDA
+pip install torch
+pip install atom3d
+pip install -U scikit-learn
+pip install torch-cluster -f https://data.pyg.org/whl/torch-1.11.0+cu116.html
+pip install torch-scatter -f https://data.pyg.org/whl/torch-1.11.0+cu116.html
+pip install torch-sparse -f https://data.pyg.org/whl/torch-1.11.0+cu116.html
+pip install torch-geometric
+pip install fair-esm  
+pip install pandas openpyxl
+```
+
+
 
 The first time you use ESM, the pioneering protein language models, it will automatically download the pretrained checkpoint. 
 Sometimes, this process can be roughly slow. A potential solution is to download the checkpoint weight manually from 
