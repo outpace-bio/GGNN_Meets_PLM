@@ -24,6 +24,26 @@ import gvp.atom3d
 from gvp import set_seed, Logger
 from egnn import egnn_clean as eg
 
+
+import torch
+# import torch.nn.functional as F
+
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+
+def ddp_setup(rank: int, world_size: int):
+    """
+     Args:
+        rank: Unique identifier of each process
+       world_size: Total number of processes
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+
 print = partial(print, flush=True)
 models_dir = 'models'
 
@@ -84,22 +104,53 @@ def collate(samples):
     return batch
 
 
-def main():
+def main(rank, world_size, total_epochs, save_every):
+    ddp_setup(rank, world_size)
+    gpu_id = rank
+
     if args.model == 'molformer': args.connect = 'FC'
-    datasets = get_datasets(args.task, args.lba_split)
+    datasets = get_datasets(args.task, args.lba_split, device=gpu_id)
     if args.plm: args.num_workers = 0  # https://stackoverflow.com/questions/59081290/not-using-multiprocessing-but-get-cuda-error-on-google-colab-while-using-pytorch
     if args.model == 'molformer':      # https://github.com/pytorch/pytorch/issues/40403
         if args.task == 'TOY':
             args.batch = 4
         dataloader = partial(torch.utils.data.DataLoader, num_workers=args.num_workers, batch_size=args.batch, collate_fn=collate)
     else:                              # older version is data.Dataloader
-        dataloader = partial(torch_geometric.loader.DataLoader, num_workers=args.num_workers, batch_size=args.batch)
-    if args.task not in ['PPI', 'RES', 'TOY']: dataloader = partial(dataloader, shuffle=True)
+        # dataloader = partial(torch_geometric.loader.DataLoader, num_workers=args.num_workers, batch_size=args.batch)
+        dataloader = partial(torch_geometric.loader.DataLoader,
+                            num_workers=args.num_workers,
+                            batch_size=args.batch,
+                            shuffle=False,
+                            sampler=DistributedSampler)
+    # if args.task not in ['PPI', 'RES', 'TOY']: dataloader = partial(dataloader, shuffle=True)
+
     log.logger.info(f'{"=" * 40} Configuration {"=" * 40}\nModel: {args.model}; Task: {args.task}; PLM: {args.plm}; Graph: {args.connect}; Epochs: {args.epochs};'
                     f' Batch Szie: {args.batch}; GPU: {args.gpu}; Worker: {args.num_workers}\n{"=" * 40} Start Training {"=" * 40}')
 
-    trainset, valset, testset = map(dataloader, datasets)
-    model = get_model(args.task, args.model).to(device)
+    # trainset, valset, testset = map(dataloader, datasets)
+
+    trainset = torch_geometric.loader.DataLoader(dataset=datasets[0],
+                                                 num_workers=args.num_workers,
+                                                 batch_size=args.batch,
+                                                 shuffle=False,
+                                                 sampler=DistributedSampler(datasets[0]))
+    
+    valset = torch_geometric.loader.DataLoader(dataset=datasets[1],
+                                                num_workers=args.num_workers,
+                                                batch_size=args.batch,
+                                                shuffle=False,
+                                                sampler=DistributedSampler(datasets[1]))
+
+    testset = torch_geometric.loader.DataLoader(dataset=datasets[2],
+                                                num_workers=args.num_workers,
+                                                batch_size=args.batch,
+                                                shuffle=False,
+                                                sampler=DistributedSampler(datasets[2]))
+
+    print(trainset.sampler)
+    # model = get_model(args.task, args.model).to(device)
+    model = DDP(get_model(args.task, args.model).to(gpu_id), device_ids=[gpu_id])
+
     if args.test:
         test(model, testset, args.test)
     else:
@@ -139,11 +190,20 @@ def train(model, trainset, valset, patience=8):
 
     best_path, best_val, wait = None, np.inf, 0
     if not os.path.exists(models_dir): os.makedirs(models_dir)
+
     for epoch in range(args.epochs):
+        print(f'Epoch: {epoch}')
+        trainset.sampler.set_epoch(epoch)
+        
         model.train()
+        
         train_loss = loop(trainset, model, optimizer=optimizer, max_time=args.train_time)
-        path = f"{models_dir}/{args.task}_{args.model}_plm{args.plm}_epoch{epoch}_{float(time.time())}.pt"
-        torch.save(model.state_dict(), path)
+        
+        
+        if self.gpu_id == 0:
+            path = f"{models_dir}/{args.task}_{args.model}_plm{args.plm}_epoch{epoch}_{float(time.time())}.pt"
+            torch.save(model.state_dict(), path)
+
         model.eval()
         with torch.no_grad():
             val_loss = loop(valset, model, max_time=args.val_time)
@@ -254,7 +314,7 @@ def forward(model, batch, device):
     return model(batch)
 
 
-def get_datasets(task, lba_split=30):
+def get_datasets(task, lba_split=30, device='cpu'):
     data_path = {'RES': 'atom3d-data/RES/raw/RES/data/', 'PPI': 'data/PPI/DIPS-split/data/', 'PSR': 'data/PSR/split-by-year/data/',
                  'MSP': 'atom3d-data/MSP/splits/split-by-sequence-identity-30/data/', 'LEP': 'atom3d-data/LEP/splits/split-by-protein/data/',
                  'LBA': f'data/LBA/split-by-sequence-identity-{lba_split}/data/', 'TOY': 'data/TOY/split-by-cath-topology/data/'}[task]      # TOY use the test dataset of RES
@@ -272,7 +332,7 @@ def get_datasets(task, lba_split=30):
             valset = gvp.atom3d.PPIDataset(val_dataset, plm=args.plm)
             testset = gvp.atom3d.PPIDataset(test_dataset, plm=args.plm)
         else:
-            dataset = LMDBDataset(data_path + 'test', transform=gvp.atom3d.PPITransform(plm=args.plm))
+            dataset = LMDBDataset(data_path + 'test', transform=gvp.atom3d.PPITransform(plm=args.plm, device=device))
             trainset, valset, testset = split_randomly(dataset)
     elif task == 'TOY':
         train_dataset, val_dataset, test_dataset = split_randomly(LMDBDataset(data_path + 'test'))
@@ -343,4 +403,7 @@ def get_model(task, model):
 
 
 if __name__ == "__main__":
-    main()
+    world_size = torch.cuda.device_count()
+    print('World size:', world_size)
+    save_every = 1
+    mp.spawn(main, args=(world_size, args.epochs, save_every,), nprocs=world_size)
