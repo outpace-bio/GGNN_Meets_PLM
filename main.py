@@ -67,7 +67,7 @@ parser.add_argument('--debug', action='store_true')
 args = parser.parse_args()
 task_tag = args.task + str(args.lba_split) if args.task == 'LBA' else args.task
 log = Logger(f'./', f'training_{task_tag}_{args.model}_{args.plm}.log')
-device = torch.device(f'cuda:{args.gpu}') if torch.cuda.is_available() and not args.debug else 'cpu'
+# device = torch.device(f'cuda:{args.gpu}') if torch.cuda.is_available() and not args.debug else 'cpu'
 set_seed(0)
 
 
@@ -147,15 +147,14 @@ def main(rank, world_size, total_epochs, save_every):
                                                 shuffle=False,
                                                 sampler=DistributedSampler(datasets[2]))
 
-    print(trainset.sampler)
     # model = get_model(args.task, args.model).to(device)
-    model = DDP(get_model(args.task, args.model).to(gpu_id), device_ids=[gpu_id])
+    model = DDP(get_model(args.task, args.model).to(gpu_id), device_ids=[gpu_id], find_unused_parameters=True)
 
     if args.test:
         test(model, testset, args.test)
     else:
         model_path = train(model, trainset, valset, patience=8)
-        test(model, testset, model_path.split('/')[-1])
+        # test(model, testset, model_path.split('/')[-1])
 
 
 def test(model, testset, model_path):
@@ -167,7 +166,7 @@ def test(model, testset, model_path):
     targets, predicts, ids = [], [], []
     with torch.no_grad():
         for batch in t:
-            pred = forward(model, batch, device)
+            pred = forward(model, batch, model.device)
             label = get_label(batch)
             if args.model == 'molformer' and args.task in ['TOY', 'PPI']:
                 mask = (batch.nodes != 21)
@@ -190,29 +189,31 @@ def train(model, trainset, valset, patience=8):
 
     best_path, best_val, wait = None, np.inf, 0
     if not os.path.exists(models_dir): os.makedirs(models_dir)
-
+    print(model.device)
     for epoch in range(args.epochs):
-        print(f'Epoch: {epoch}')
         trainset.sampler.set_epoch(epoch)
         
         model.train()
         
         train_loss = loop(trainset, model, optimizer=optimizer, max_time=args.train_time)
-        
-        
-        if self.gpu_id == 0:
-            path = f"{models_dir}/{args.task}_{args.model}_plm{args.plm}_epoch{epoch}_{float(time.time())}.pt"
-            torch.save(model.state_dict(), path)
+    
 
         model.eval()
         with torch.no_grad():
             val_loss = loop(valset, model, max_time=args.val_time)
         log.logger.info(f'[Epoch {epoch}] Train loss: {train_loss:.8f} Val loss: {val_loss:.8f}')
-        if val_loss < best_val:
-            best_path, best_val = path, val_loss
-        else:
-            wait += 1
+
+        if '0' in str(model.device):
+            path = f"{models_dir}/{args.task}_{args.model}_plm{args.plm}_epoch{epoch}_val_loss_{val_loss}_{float(time.time())}.chkpt"
+            print(f'Saving to: {path}')
+            torch.save(model, path) #.state_dict()
+            if val_loss < best_val:
+                best_path, best_val = path, val_loss
+            else:
+                wait += 1
+
         log.logger.info(f'Best {best_path} Val loss: {best_val:.8f}\n')
+        
         if wait >= patience: break                                          # early stop
         lr_scheduler.step(val_loss)                                         # based on validation loss
     return best_path
@@ -228,7 +229,7 @@ def loop(dataset, model, optimizer=None, max_time=None):
         if max_time and (time.time() - start) > 60 * max_time: break
         if optimizer: optimizer.zero_grad()
         try:
-            out = forward(model, batch, device)
+            out = forward(model, batch, model.device)
         except RuntimeError as e:
             if "CUDA out of memory" not in str(e): raise e
             torch.cuda.empty_cache()
@@ -238,7 +239,7 @@ def loop(dataset, model, optimizer=None, max_time=None):
         if args.model == 'molformer' and args.task in ['TOY', 'PPI']:
             mask = (batch.nodes != 21)
             label, out = label[mask], out[mask]
-        loss_value = loss_fn(out, label.cuda())
+        loss_value = loss_fn(out, label.to(model.device))
         total_loss += float(loss_value)
         total_count += 1
 

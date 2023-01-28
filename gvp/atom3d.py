@@ -37,12 +37,12 @@ def _edge_features(coords, edge_index, D_max=4.5, num_rbf=16, device='cpu'):
     return edge_s, edge_v
 
 
-def get_plm_reps(df, model, converter):
+def get_plm_reps(df, model, converter, device='cuda:0'):
     seq = ''.join([RESTYPE_3to1(i) for i in list(df['resname'])])
     batch_tokens = converter([("_", seq)])[2]  # [label, sequence]
-    batch_tokens = batch_tokens.to(model.device)
+    batch_tokens = batch_tokens.to(device)
     with torch.no_grad():
-        results = model(batch_tokens, repr_layers=[33], return_contacts=True)  # Extract per-residue representations
+        results = model(batch_tokens, repr_layers=[33], return_contacts=False)  # Extract per-residue representations
     token_reps = results["representations"][33][:, 1:-1][0].detach()                  # the head and tail tokens are placeholder
     return token_reps
 
@@ -206,7 +206,8 @@ class PPITransform(BaseTransform):  # IterableDataset cannot achieve this goal w
         if self.plm:
             self.model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()  # load the latest ESM-2
             self.batch_converter = alphabet.get_batch_converter()
-            self.model.eval().cuda()
+            self.model.eval()
+            self.model = self.model.to(self.device)
 
     def __call__(self, elem, index_filter=False):
         pairs = elem['atoms_pairs']
@@ -220,8 +221,8 @@ class PPITransform(BaseTransform):  # IterableDataset cannot achieve this goal w
         graph1.label = (torch.sum(dist, dim=-1) > 0).float()
         graph2.label = (torch.sum(dist, dim=0) > 0).float()
         if self.plm:
-            token_reps1 = get_plm_reps(bound1, self.model, self.batch_converter)
-            token_reps2 = get_plm_reps(bound2, self.model, self.batch_converter)
+            token_reps1 = get_plm_reps(bound1, self.model, self.batch_converter, device=self.device)
+            token_reps2 = get_plm_reps(bound2, self.model, self.batch_converter, device=self.device)
             graph1.plm, graph2.plm = token_reps1, token_reps2
         return graph1, graph2
 
@@ -236,7 +237,8 @@ class PPIDataset(Dataset):
         if self.plm:
             self.model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
             self.batch_converter = alphabet.get_batch_converter()
-            self.model.eval().cuda()
+            self.model.eval()
+            self.model = self.model.to(self.device)
 
     def __len__(self):
         return len(self.dataset)
