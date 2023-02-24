@@ -142,61 +142,6 @@ class BaseModel(nn.Module):
         return out
 
 
-class PSRTransform(BaseTransform):
-    """
-    Transforms dict-style entries from the ATOM3D PSR dataset to featurized graphs. Returns a `torch_geometric.data.Data`
-    graph with attribute `label` for the GDT_TS, `id` for the name of the target, and all structural attributes as described in BaseTransform.
-    Residue-level graphs.
-    """
-
-    def __init__(self, plm=False, **kwargs):
-        super().__init__(**kwargs)
-        self.plm = plm
-        if self.plm:
-            self.model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()  # load the latest ESM-2
-            self.batch_converter = alphabet.get_batch_converter()
-            self.model.eval()
-            self.model = self.model.to(self.device)
-
-    def __call__(self, elem, index_filter=False):
-        df = elem['atoms']
-        if index_filter: df = df[df.residue > 0]  # ensure residue index > 0
-        df_ca = df[df['name'] == 'CA']            # only CA to build residue-level graph
-        data = super().__call__(df_ca)            # use parent's function to process df
-        data.label = elem['scores']['gdt_ts']
-        data.id = eval(elem['id'])[0]
-        if self.plm: data.plm = get_plm_reps(df_ca, self.model, self.batch_converter)
-        return data
-
-
-class PSRDataset(Dataset):
-
-    def __init__(self, lmdb_dataset, plm=False, device='cpu'):
-        self.dataset = lmdb_dataset
-        self.device = device
-        self.plm = plm
-        if self.plm:
-            self.model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()  # load the latest ESM-2
-            self.batch_converter = alphabet.get_batch_converter()
-            self.model.eval().cuda()
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, item):
-        with torch.no_grad():
-            df = self.dataset[item]['atoms']
-            df = df[df['name'] == 'CA']
-            nodes = torch.as_tensor(list(map(_amino_acids, df.resname)), dtype=torch.long, device=self.device)
-            coords = torch.as_tensor(df[['x', 'y', 'z']].to_numpy(), dtype=torch.float32, device=self.device)
-            label = torch.as_tensor(self.dataset[item]['scores']['gdt_ts'], device=self.device)
-        id = eval(self.dataset[item]['id'])[0]
-        if self.plm:
-            token_reps = get_plm_reps(df, self.model, self.batch_converter)
-            return nodes, coords, (label, id), token_reps
-        return nodes, coords, (label, id)
-
-
 class PPITransform(BaseTransform):  # IterableDataset cannot achieve this goal with PLM, since the gradient disappear
 
     def __init__(self, plm=False, cutoff=8, **kwargs):
@@ -215,6 +160,7 @@ class PPITransform(BaseTransform):  # IterableDataset cannot achieve this goal w
 
         subunits = pairs['subunit'].unique()
         bound1, bound2 = pairs[pairs['subunit'] == subunits[0]], pairs[pairs['subunit'] == subunits[1]]
+        
         graph1, graph2 = super().__call__(bound1), super().__call__(bound2)
         dist = torch.cdist(graph1.x, graph2.x) < self.cutoff
 
@@ -224,7 +170,48 @@ class PPITransform(BaseTransform):  # IterableDataset cannot achieve this goal w
             token_reps1 = get_plm_reps(bound1, self.model, self.batch_converter, device=self.device)
             token_reps2 = get_plm_reps(bound2, self.model, self.batch_converter, device=self.device)
             graph1.plm, graph2.plm = token_reps1, token_reps2
-        return graph1, graph2
+        return [graph1, graph2]
+
+class PPBindingTransform(BaseTransform):  # IterableDataset cannot achieve this goal with PLM, since the gradient disappear
+    # Paul addition
+    def __init__(self, plm=False, cutoff=8, **kwargs):
+        super().__init__(**kwargs)
+        self.plm = plm
+        self.cutoff = cutoff
+        if self.plm:
+            self.model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()  # load the latest ESM-2
+            self.batch_converter = alphabet.get_batch_converter()
+            self.model.eval()
+            self.model = self.model.to(self.device)
+
+    def __call__(self, elem, index_filter=False):
+        pairs = elem['atoms_pairs']
+        pairs = pairs[pairs['name'] == 'CA']
+
+        subunits = pairs['subunit'].unique()
+        bound1, bound2 = pairs[pairs['subunit'] == subunits[0]].copy(), pairs[pairs['subunit'] == subunits[1]].copy()
+        
+        bound1['x'] = bound1['x'] - bound1['x'].mean()
+        bound1['y'] = bound1['y'] - bound1['y'].mean()
+        bound1['z'] = bound1['z'] - bound1['z'].mean()
+        bound2['x'] = bound2['x'] - bound2['x'].mean()
+        bound2['y'] = bound2['y'] - bound2['y'].mean()
+        bound2['z'] = bound2['z'] - bound2['z'].mean()
+
+        graph1, graph2 = super().__call__(bound1), super().__call__(bound2)
+        
+        graph1.label = elem['bind']
+        graph2.label = elem['bind']
+        if self.plm:
+            graph1.plm = get_plm_reps(bound1, self.model, self.batch_converter, device=self.device)
+            graph2.plm = get_plm_reps(bound2, self.model, self.batch_converter, device=self.device)
+            # if (elem['esm_emb_p1'] is not None) and (elem['esm_emb_p2'] is not None):
+            #     graph1.plm = torch.tensor(elem['esm_emb_p1'], dtype=torch.float32, device=self.device)
+            #     graph2.plm = torch.tensor(elem['esm_emb_p2'], dtype=torch.float32, device=self.device)
+            # else:
+            #     graph1.plm = get_plm_reps(bound1, self.model, self.batch_converter, device=self.device)
+            #     graph2.plm = get_plm_reps(bound2, self.model, self.batch_converter, device=self.device)
+        return [graph1, graph2]
 
 
 class PPIDataset(Dataset):

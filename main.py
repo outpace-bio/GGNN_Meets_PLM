@@ -48,7 +48,7 @@ print = partial(print, flush=True)
 models_dir = 'models'
 
 parser = argparse.ArgumentParser()
-parser.add_argument('task', metavar='TASK', default='PSR', choices=['PSR', 'PPI', 'RES', 'MSP', 'LBA', 'LEP', 'TOY'])
+parser.add_argument('task', metavar='TASK', default='PSR', choices=['PPBind', 'PPI'])
 parser.add_argument('--toy', metavar='TOY TARGET', type=str, default='id', choices=['id', 'dist'])
 parser.add_argument('--connect', metavar='CONNECTION', type=str, default='rball', choices=['rball', 'knn'])
 parser.add_argument('--model', metavar='MODEL', type=str, default='gvp', choices=['egnn', 'gvp', 'molformer'])  # metavar will show in help information
@@ -108,26 +108,15 @@ def main(rank, world_size, total_epochs, save_every):
     ddp_setup(rank, world_size)
     gpu_id = rank
 
-    if args.model == 'molformer': args.connect = 'FC'
     datasets = get_datasets(args.task, args.lba_split, device=gpu_id)
-    if args.plm: args.num_workers = 0  # https://stackoverflow.com/questions/59081290/not-using-multiprocessing-but-get-cuda-error-on-google-colab-while-using-pytorch
-    if args.model == 'molformer':      # https://github.com/pytorch/pytorch/issues/40403
-        if args.task == 'TOY':
-            args.batch = 4
-        dataloader = partial(torch.utils.data.DataLoader, num_workers=args.num_workers, batch_size=args.batch, collate_fn=collate)
-    else:                              # older version is data.Dataloader
-        # dataloader = partial(torch_geometric.loader.DataLoader, num_workers=args.num_workers, batch_size=args.batch)
-        dataloader = partial(torch_geometric.loader.DataLoader,
-                            num_workers=args.num_workers,
-                            batch_size=args.batch,
-                            shuffle=False,
-                            sampler=DistributedSampler)
-    # if args.task not in ['PPI', 'RES', 'TOY']: dataloader = partial(dataloader, shuffle=True)
-
+    # if args.plm: args.num_workers = 0  # https://stackoverflow.com/questions/59081290/not-using-multiprocessing-but-get-cuda-error-on-google-colab-while-using-pytorch
+    
+    # There is an issue serializing LMDB data in multiprocessing mode so we need to set num_workers to 0
+    args.num_workers = 0
+    
     log.logger.info(f'{"=" * 40} Configuration {"=" * 40}\nModel: {args.model}; Task: {args.task}; PLM: {args.plm}; Graph: {args.connect}; Epochs: {args.epochs};'
                     f' Batch Szie: {args.batch}; GPU: {args.gpu}; Worker: {args.num_workers}\n{"=" * 40} Start Training {"=" * 40}')
 
-    # trainset, valset, testset = map(dataloader, datasets)
 
     trainset = torch_geometric.loader.DataLoader(dataset=datasets[0],
                                                  num_workers=args.num_workers,
@@ -183,20 +172,19 @@ def test(model, testset, model_path):
         log.logger.info(f"{name}: {value}")
 
 
-def train(model, trainset, valset, patience=8):
+def train(model, trainset, valset, patience=3):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.6, patience=5, min_lr=5e-7)
 
     best_path, best_val, wait = None, np.inf, 0
     if not os.path.exists(models_dir): os.makedirs(models_dir)
-    print(model.device)
+
     for epoch in range(args.epochs):
         trainset.sampler.set_epoch(epoch)
         
         model.train()
         
         train_loss = loop(trainset, model, optimizer=optimizer, max_time=args.train_time)
-    
 
         model.eval()
         with torch.no_grad():
@@ -204,10 +192,11 @@ def train(model, trainset, valset, patience=8):
         log.logger.info(f'[Epoch {epoch}] Train loss: {train_loss:.8f} Val loss: {val_loss:.8f}')
 
         if '0' in str(model.device):
-            path = f"{models_dir}/{args.task}_{args.model}_plm{args.plm}_epoch{epoch}_val_loss_{val_loss}_{float(time.time())}.chkpt"
-            print(f'Saving to: {path}')
-            torch.save(model, path) #.state_dict()
             if val_loss < best_val:
+                path = f"{models_dir}/{args.task}_centered_coords_{args.model}_plm{args.plm}_epoch{epoch}_val_loss_{val_loss}.chkpt"
+                print(f'Saving to: {path}')
+                torch.save(model.state_dict(), path)
+
                 best_path, best_val = path, val_loss
             else:
                 wait += 1
@@ -235,10 +224,8 @@ def loop(dataset, model, optimizer=None, max_time=None):
             torch.cuda.empty_cache()
             print('Skipped batch due to OOM', flush=True)
             continue
+        
         label = get_label(batch)
-        if args.model == 'molformer' and args.task in ['TOY', 'PPI']:
-            mask = (batch.nodes != 21)
-            label, out = label[mask], out[mask]
         loss_value = loss_fn(out, label.to(model.device))
         total_loss += float(loss_value)
         total_count += 1
@@ -266,9 +253,12 @@ def load(model, path):
             model.state_dict()[name].copy_(p)
 
 
-def get_label(batch):
-    if type(batch) in [list, tuple]:
+def get_label(batch, task=args.task):
+    if task == 'PPBind':
+        return batch[0].label.float()
+    elif type(batch) in [list, tuple]:
         return torch.cat([i.label for i in batch])
+
     return batch.label
 
 
@@ -293,14 +283,11 @@ def get_metrics(task):
 
 
 def get_loss(task):
-    if task in ['PSR', 'LBA']:
-        return nn.MSELoss()                      # regression
-    elif task in ['PPI', 'MSP', 'LEP']:
+    if task == 'PPBind':
+        return nn.BCEWithLogitsLoss()
+    elif task in ['PPI']:
         return nn.BCELoss()                      # binary classification
-    elif task in ['RES']:
-        return nn.CrossEntropyLoss()             # multiclass classification
-    elif task in ['TOY']:
-        return nn.MSELoss() if args.toy == 'dist' else nn.CrossEntropyLoss()
+
 
 
 def forward(model, batch, device):
@@ -316,90 +303,32 @@ def forward(model, batch, device):
 
 
 def get_datasets(task, lba_split=30, device='cpu'):
-    data_path = {'RES': 'atom3d-data/RES/raw/RES/data/', 'PPI': 'data/PPI/DIPS-split/data/', 'PSR': 'data/PSR/split-by-year/data/',
-                 'MSP': 'atom3d-data/MSP/splits/split-by-sequence-identity-30/data/', 'LEP': 'atom3d-data/LEP/splits/split-by-protein/data/',
-                 'LBA': f'data/LBA/split-by-sequence-identity-{lba_split}/data/', 'TOY': 'data/TOY/split-by-cath-topology/data/'}[task]      # TOY use the test dataset of RES
+    data_path = {'PPI': 'data/PPI/DIPS-split/data/', 'PPBind': 'data/paul_PPbind/test/'}[task]      # TOY use the test dataset of RES
 
-    if task == 'RES':
-        split_path = 'atom3d-data/RES/splits/split-by-cath-topology/indices/'
-        dataset = partial(gvp.atom3d.RESDataset, data_path)
-        trainset = dataset(split_path=split_path + 'train_indices.txt')
-        valset = dataset(split_path=split_path + 'val_indices.txt')
-        testset = dataset(split_path=split_path + 'test_indices.txt')
-    elif task == 'PPI':
-        if args.model == 'molformer':
-            train_dataset, val_dataset, test_dataset = split_randomly(LMDBDataset(data_path + 'test'))
-            trainset = gvp.atom3d.PPIDataset(train_dataset, plm=args.plm)
-            valset = gvp.atom3d.PPIDataset(val_dataset, plm=args.plm)
-            testset = gvp.atom3d.PPIDataset(test_dataset, plm=args.plm)
-        else:
-            dataset = LMDBDataset(data_path + 'test', transform=gvp.atom3d.PPITransform(plm=args.plm, device=device))
-            trainset, valset, testset = split_randomly(dataset)
-    elif task == 'TOY':
-        train_dataset, val_dataset, test_dataset = split_randomly(LMDBDataset(data_path + 'test'))
-        if args.model == 'molformer':
-            trainset = gvp.atom3d.TOYDataset2(train_dataset, label=args.toy)
-            valset = gvp.atom3d.TOYDataset2(val_dataset, label=args.toy)
-            testset = gvp.atom3d.TOYDataset2(test_dataset, label=args.toy)
-        else:
-            trainset = gvp.atom3d.TOYDataset(train_dataset, label=args.toy, connection=args.connect)
-            valset = gvp.atom3d.TOYDataset(val_dataset, label=args.toy, connection=args.connect)
-            testset = gvp.atom3d.TOYDataset(test_dataset, label=args.toy, connection=args.connect)
-    else:
-        if task == 'PSR':
-            if args.model == 'molformer':
-                trainset = gvp.atom3d.PSRDataset(LMDBDataset(data_path + 'train'), plm=args.plm)
-                valset = gvp.atom3d.PSRDataset(LMDBDataset(data_path + 'val'), plm=args.plm)
-                testset = gvp.atom3d.PSRDataset(LMDBDataset(data_path + 'test'), plm=args.plm)
-                return trainset, valset, testset
-            transform = gvp.atom3d.PSRTransform(plm=args.plm)
-        elif task == 'LBA':
-            if args.model == 'molformer':
-                trainset = gvp.atom3d.LBADataset(LMDBDataset(data_path + 'train'), plm=args.plm)
-                valset = gvp.atom3d.LBADataset(LMDBDataset(data_path + 'val'), plm=args.plm)
-                testset = gvp.atom3d.LBADataset(LMDBDataset(data_path + 'test'), plm=args.plm)
-                return trainset, valset, testset
-            transform = gvp.atom3d.LBATransform(plm=args.plm)
-        else:
-            transform = {'MSP': gvp.atom3d.MSPTransform, 'LEP': gvp.atom3d.LEPTransform}[task]()
-        trainset = LMDBDataset(data_path + 'train', transform=transform)
-        valset = LMDBDataset(data_path + 'val', transform=transform)
-        testset = LMDBDataset(data_path + 'test', transform=transform)
-        print(len(trainset), len(valset), len(testset))
+    if task == 'PPI':
+        # Paul edit -- they took only the test data and split it into train, val, test. Seems like the train data would
+        # leak into the test data. 
+        # After checking Atom3D, it seems that a seed is set so the splits should always be the same.
+        dataset = LMDBDataset(data_path + 'test', transform=gvp.atom3d.PPITransform(plm=args.plm, device=device))
+        trainset, valset, testset = split_randomly(dataset)
+        # Let's load the predefined train, val, test splits (Paul)
+        # trainset = LMDBDataset(data_path + 'train', transform=gvp.atom3d.PPITransform(plm=args.plm, device=device))
+        # valset = LMDBDataset(data_path + 'val', transform=gvp.atom3d.PPITransform(plm=args.plm, device=device))
+        # testset = LMDBDataset(data_path + 'test', transform=gvp.atom3d.PPITransform(plm=args.plm, device=device))
+    elif task == 'PPBind':
+        dataset = LMDBDataset(data_path, transform=gvp.atom3d.PPBindingTransform(plm=args.plm, device=device))
+        trainset, valset, testset = split_randomly(dataset)
+
+    print(len(trainset), len(valset), len(testset))
     return trainset, valset, testset
 
 
 def get_model(task, model):
-    if model == 'gvp':
-        if task == 'TOY':
-            return gvp.atom3d.TOYModel(args.toy)
-        elif task == 'PSR':
-            return gvp.atom3d.BaseModel(plm=args.plm)
-        elif task == 'LBA':
-            return gvp.atom3d.LBAModel(plm=args.plm)
-        elif task == 'PPI':
-            return gvp.atom3d.PPIModel(plm=args.plm)
-        return {'RES': gvp.atom3d.RESModel, 'MSP': gvp.atom3d.MSPModel, 'LEP': gvp.atom3d.LEPModel}[task]()
-    elif model == 'egnn':
-        if task == 'TOY':
-            return eg.TOYModel(args.toy)
-        elif task == 'PSR':
-            return eg.PSRModel(plm=args.plm)
-        elif task == 'LBA':
-            return eg.LBAModel(plm=args.plm)
+    if model == 'egnn':
+        if task == 'PPBind':
+            return eg.PPBindingModel(plm=args.plm)
         elif task == 'PPI':
             return eg.PPIModel(plm=args.plm)
-        return {}[task]()
-    elif model == 'molformer':
-        import molformer.tr_cpe as tr
-        if task == 'TOY':
-            return tr.TOYModel(args.toy)
-        elif task == 'PSR':
-            return tr.PSRModel(plm=args.plm)
-        elif task == 'LBA':
-            return tr.LBAModel(plm=args.plm)
-        elif task == 'PPI':
-            return tr.PPIModel(plm=args.plm)
         return {}[task]()
 
 

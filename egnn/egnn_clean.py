@@ -56,6 +56,9 @@ class E_GCL(nn.Module):
         else:
             agg = torch.cat([x, agg], dim=1)
         out = self.node_mlp(agg)
+        # print('x shape in node model:', x.shape)
+        # print('agg shape in node model:', agg.shape)
+        # print('Node MLP out shape in node model:', out.shape)
         if self.residual:
             out = x + out
         return out, agg
@@ -251,10 +254,54 @@ class LBAModel(EGNN):
 class PPIModel(EGNN):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.dense = nn.Sequential(nn.Linear(self.hidden_nf, 2 * self.hidden_nf), nn.ReLU(inplace=True), nn.Dropout(p=0.1), nn.Linear(2 * self.hidden_nf, 1))
+        # self.dense = nn.Sequential(nn.Linear(self.hidden_nf, 2 * self.hidden_nf), nn.ReLU(inplace=True), nn.Dropout(p=0.1), nn.Linear(2 * self.hidden_nf, 1))
+        self.dense = nn.Sequential(
+            nn.Linear(self.hidden_nf, 2 * self.hidden_nf),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),
+            nn.Linear(2 * self.hidden_nf, 128), # Adding a 128-dim layer to use with Genie
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),
+            nn.Linear(128, 1))
 
     def forward(self, batch):
         graph1, graph2 = batch
         out1 = self.dense(super().forward(graph1))
         out2 = self.dense(super().forward(graph2))
         return torch.sigmoid(torch.cat([out1, out2]).squeeze(-1))
+
+
+class PPBindingModel(EGNN):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.dense = nn.Sequential(
+            nn.Linear(2 * self.hidden_nf, 2 * self.hidden_nf),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),
+            nn.Linear(2 * self.hidden_nf, self.hidden_nf),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),
+            nn.Linear(self.hidden_nf, 1)
+            )
+            
+        # self.to(self.device)
+
+    def forward(self, batch):
+        graph1, graph2 = batch
+        out1 = super().forward(graph1)
+        out2 = super().forward(graph2)
+
+        # Take the mean of the node embeddings to make a single representation of each protein
+        reshaped_batch = []
+        for i in range(graph1.ptr.shape[0] - 1):
+            chain1 = out1[graph1.ptr[i]:graph1.ptr[i+1]:, :].mean(axis=0)
+            chain2 = out2[graph2.ptr[i]:graph2.ptr[i+1]:, :].mean(axis=0)
+            reshaped_batch.append(torch.cat([chain1, chain2], dim=-1))
+        
+        # Concatenate the two representations and pass through a dense layer
+        final = self.dense(torch.stack(reshaped_batch, dim=0))
+
+        # Sigmoid is not needed here because BCEWithLogitsLoss is used during training.
+        # For inference, apply sigmoid on the model output.
+        return final.squeeze()
+
