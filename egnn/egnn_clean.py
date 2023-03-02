@@ -86,6 +86,7 @@ class E_GCL(nn.Module):
         return radial, coord_diff
 
     def forward(self, h, edge_index, coord, edge_attr=None, node_attr=None):
+        # h = PLM embeddings or node embeddings if no pLM
         row, col = edge_index
         radial, coord_diff = self.coord2radial(edge_index, coord)
 

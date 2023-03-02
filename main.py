@@ -316,7 +316,7 @@ def get_datasets(task, lba_split=30, device='cpu'):
         # valset = LMDBDataset(data_path + 'val', transform=gvp.atom3d.PPITransform(plm=args.plm, device=device))
         # testset = LMDBDataset(data_path + 'test', transform=gvp.atom3d.PPITransform(plm=args.plm, device=device))
     elif task == 'PPBind':
-        dataset = LMDBDataset(data_path, transform=gvp.atom3d.PPBindingTransform(plm=args.plm, device=device))
+        dataset = LMDBDataset(data_path, transform=gvp.atom3d.PPBindingTransform(plm=args.plm, use_frenet_serret_frames=True, device=device))
         trainset, valset, testset = split_randomly(dataset)
 
     print(len(trainset), len(valset), len(testset))

@@ -144,16 +144,42 @@ class BaseModel(nn.Module):
 
 class PPITransform(BaseTransform):  # IterableDataset cannot achieve this goal with PLM, since the gradient disappear
 
-    def __init__(self, plm=False, cutoff=8, **kwargs):
+    def __init__(self, plm=False, cutoff=8, use_frenet_serret_frames=False, **kwargs):
         super().__init__(**kwargs)
         self.plm = plm
         self.cutoff = cutoff
+        self.use_frenet_serret_frames = use_frenet_serret_frames
         if self.plm:
             self.model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()  # load the latest ESM-2
             self.batch_converter = alphabet.get_batch_converter()
             self.model.eval()
             self.model = self.model.to(self.device)
 
+    def compute_frenet_frames(x, mask, eps=1e-10):
+        # x: [b, n_res, 3]
+        t = x[:, 1:] - x[:, :-1]
+        t_norm = torch.sqrt(eps + torch.sum(t ** 2, dim=-1))
+        t = t / t_norm.unsqueeze(-1)
+
+        b = torch.cross(t[:, :-1], t[:, 1:])
+        b_norm = torch.sqrt(eps + torch.sum(b ** 2, dim=-1))
+        b = b / b_norm.unsqueeze(-1)
+
+        n = torch.cross(b, t[:, 1:])
+
+        tbn = torch.stack([t[:, 1:], b, n], dim=-1)
+
+        rots = []
+        for i in range(mask.shape[0]):
+            rots_ = torch.eye(3).unsqueeze(0).repeat(mask.shape[1], 1, 1)
+            length = torch.sum(mask[i]).int()
+            rots_[1:length-1] = tbn[i, :length-2]
+            rots_[0] = rots_[1]
+            rots_[length-1] = rots_[length-2]
+            rots.append(rots_)
+        rots = torch.stack(rots, dim=0).to(x.device)
+
+        return rots
     def __call__(self, elem, index_filter=False):
         pairs = elem['atoms_pairs']
         pairs = pairs[pairs['name'] == 'CA']
@@ -166,23 +192,65 @@ class PPITransform(BaseTransform):  # IterableDataset cannot achieve this goal w
 
         graph1.label = (torch.sum(dist, dim=-1) > 0).float()
         graph2.label = (torch.sum(dist, dim=0) > 0).float()
+        
         if self.plm:
             token_reps1 = get_plm_reps(bound1, self.model, self.batch_converter, device=self.device)
             token_reps2 = get_plm_reps(bound2, self.model, self.batch_converter, device=self.device)
             graph1.plm, graph2.plm = token_reps1, token_reps2
+        
+        if self.use_frenet_serret_frames:
+            x = graph1.x.unsqueeze(0)
+            mask = torch.ones(x.shape[1]).unsqueeze(0)
+            frames = self.compute_frenet_frames(x, mask)
+            graph1.x = frames.reshape(frames.shape[1], -1)
+
+            x = graph2.x.unsqueeze(0)
+            mask = torch.ones(x.shape[1]).unsqueeze(0)
+            frames = self.compute_frenet_frames(x, mask)
+            graph2.x = frames.reshape(frames.shape[1], -1)
+
         return [graph1, graph2]
+
+
 
 class PPBindingTransform(BaseTransform):  # IterableDataset cannot achieve this goal with PLM, since the gradient disappear
     # Paul addition
-    def __init__(self, plm=False, cutoff=8, **kwargs):
+    def __init__(self, plm=False, cutoff=8, use_frenet_serret_frames=False, **kwargs):
         super().__init__(**kwargs)
         self.plm = plm
         self.cutoff = cutoff
+        self.use_frenet_serret_frames = use_frenet_serret_frames
         if self.plm:
             self.model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()  # load the latest ESM-2
             self.batch_converter = alphabet.get_batch_converter()
             self.model.eval()
             self.model = self.model.to(self.device)
+
+    def compute_frenet_frames(self, x, mask, eps=1e-10):
+        # x: [b, n_res, 3]
+        t = x[:, 1:] - x[:, :-1]
+        t_norm = torch.sqrt(eps + torch.sum(t ** 2, dim=-1))
+        t = t / t_norm.unsqueeze(-1)
+
+        b = torch.cross(t[:, :-1], t[:, 1:])
+        b_norm = torch.sqrt(eps + torch.sum(b ** 2, dim=-1))
+        b = b / b_norm.unsqueeze(-1)
+
+        n = torch.cross(b, t[:, 1:])
+
+        tbn = torch.stack([t[:, 1:], b, n], dim=-1)
+
+        rots = []
+        
+        for i in range(mask.shape[0]):
+            rots_ = torch.eye(3).unsqueeze(0).repeat(mask.shape[1], 1, 1)
+            length = torch.sum(mask[i]).int()
+            rots_[1:length-1] = tbn[i, :length-2]
+            rots_[0] = rots_[1]
+            rots_[length-1] = rots_[length-2]
+            rots.append(rots_)
+        rots = torch.stack(rots, dim=0).to(x.device)
+        return rots
 
     def __call__(self, elem, index_filter=False):
         pairs = elem['atoms_pairs']
@@ -202,6 +270,8 @@ class PPBindingTransform(BaseTransform):  # IterableDataset cannot achieve this 
         
         graph1.label = elem['bind']
         graph2.label = elem['bind']
+        graph1.subunit = subunits[0]
+        graph2.subunit = subunits[1]
         if self.plm:
             graph1.plm = get_plm_reps(bound1, self.model, self.batch_converter, device=self.device)
             graph2.plm = get_plm_reps(bound2, self.model, self.batch_converter, device=self.device)
@@ -211,6 +281,17 @@ class PPBindingTransform(BaseTransform):  # IterableDataset cannot achieve this 
             # else:
             #     graph1.plm = get_plm_reps(bound1, self.model, self.batch_converter, device=self.device)
             #     graph2.plm = get_plm_reps(bound2, self.model, self.batch_converter, device=self.device)
+        if self.use_frenet_serret_frames:
+            x = graph1.x.unsqueeze(0)
+            mask = torch.ones(x.shape[1]).unsqueeze(0)
+            frames = self.compute_frenet_frames(x, mask)
+            graph1.x = frames.reshape(frames.shape[1], -1)
+            
+            x = graph2.x.unsqueeze(0)
+            mask = torch.ones(x.shape[1]).unsqueeze(0)
+            frames = self.compute_frenet_frames(x, mask)
+            graph2.x = frames.reshape(frames.shape[1], -1)
+
         return [graph1, graph2]
 
 
